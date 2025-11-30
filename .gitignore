@@ -1,0 +1,12 @@
+# Datos
+data/raw/*
+data/processed/*
+*.csv
+
+# Archivos de sistema y R
+.DS_Store
+.Rhistory
+.RData
+.Rproj.user
+__pycache__/
+*.pyc

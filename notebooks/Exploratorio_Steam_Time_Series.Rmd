@@ -1,0 +1,327 @@
+---
+title: "Modelado de Series de Tiempo: Team Fortress 2"
+author: "César - Maestría en Cómputo Estadístico"
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    theme: united
+---
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(forecast)
+library(tseries)
+library(ggplot2)
+library(ggthemes)
+
+# Definir ruta relativa (Asumiendo que el Rmd está en la carpeta 'notebooks')
+DATA_PATH <- "/home/cesar/steam-time-series-modeling/data/raw/tf2_daily_players.csv"
+
+if(!file.exists(DATA_PATH)) {
+  stop("Error: No se encuentra el archivo de datos. Verifica la ruta.")
+}
+
+datos <- read_csv(DATA_PATH, show_col_types = FALSE) %>%
+  mutate(fecha = as.Date(fecha)) %>%
+  arrange(fecha)
+
+# Vista previa
+head(datos)
+```
+
+```{r}
+ggplot(datos, aes(x = fecha, y = jugadores)) +
+  geom_line(color = "#2c3e50", size = 0.5) +
+  labs(title = "Team Fortress 2: Jugadores Simultáneos (Diario)",
+       subtitle = "Serie histórica completa (2007 - Presente)",
+       y = "Jugadores (CCU)", x = "") +
+  theme_economist()
+```
+
+```{r}
+library(ggthemes) # Asegúrate de tener instalado el paquete ggthemes
+
+# Asumiendo que 'fecha' en 'datos' es de tipo Date y el resto del código es correcto.
+
+# 1. Convierte la columna 'fecha' a tipo Date si aún no lo está (es crucial para scale_x_date)
+# datos$fecha <- as.Date(datos$fecha)
+
+# 2. Define la fecha de inicio para los últimos 5 años (o el rango que desees)
+fecha_inicio <- as.Date("2020-01-01")
+
+ggplot(datos, aes(x = fecha, y = jugadores)) +
+  geom_line(color = "#2c3e50", size = 0.5) +
+  labs(title = "Team Fortress 2: Jugadores Simultáneos (Últimos 5 Años)",
+       subtitle = "Serie de 2020 - Presente",
+       y = "Jugadores (CCU)", x = "") +
+  # **Límite del Eje X para expandir la vista en ese rango**
+  scale_x_date(limits = c(fecha_inicio, max(datos$fecha)),
+               # Opcional: Especificar los saltos (breaks) para que haya más espacio entre etiquetas
+               breaks = "1 year",
+               date_labels = "%Y") +
+  theme_economist()
+```
+
+
+```{r}
+datos <- datos %>%
+  mutate(dia_semana = wday(fecha, label = TRUE, week_start = 1)) # Lunes = 1
+
+ggplot(datos, aes(x = dia_semana, y = jugadores, fill = dia_semana)) +
+  geom_boxplot(outlier.alpha = 0.1, show.legend = FALSE) +
+  labs(title = "Distribución de Jugadores por Día",
+       subtitle = "Evidencia visual del componente estacional semanal",
+       y = "Jugadores", x = "") +
+  scale_fill_brewer(palette = "Paired") +
+  theme_minimal()
+```
+
+```{r}
+# Usaremos los últimos 2 años para evitar ruido de tendencias muy antiguas
+datos_recent <- tail(datos, 730)
+ts_recent <- ts(datos_recent$jugadores, frequency = 7)
+
+adf_resultado <- adf.test(ts_recent)
+print(adf_resultado)
+```
+
+
+```{r}
+# --- CORRECCIÓN DE ERROR ---
+# Usamos week_start = 1 para que: 1=Lunes ... 6=Sábado, 7=Domingo
+# Así no importa si tu R está en inglés, español o chino.
+
+datos_model <- datos_recent %>%
+  mutate(
+    num_dia = wday(fecha, label = FALSE, week_start = 1),
+    # Hipótesis TF2: El pico empieza el Viernes(5), Sábado(6) y Domingo(7)
+    fin_de_semana = ifelse(num_dia %in% c(5, 6, 7), 1, 0) 
+  )
+
+# VERIFICACIÓN (Importante: NO debe salir todo en 0)
+cat("Conteo de días marcados como Fin de Semana:\n")
+print(table(datos_model$fin_de_semana))
+
+# Si sale algo como:
+# 0    1 
+# 520  210
+# ¡ENTONCES ESTÁ BIEN!
+
+# Preparar matrices corregidas
+ts_jugadores <- ts(datos_model$jugadores, frequency = 7)
+xreg_matrix <- as.matrix(datos_model$fin_de_semana)
+
+# Split nuevamente
+n_total <- length(ts_jugadores)
+n_test <- 30
+n_train <- n_total - n_test
+
+train_ts <- subset(ts_jugadores, end = n_train)
+test_ts  <- subset(ts_jugadores, start = n_train + 1)
+xreg_train <- xreg_matrix[1:n_train, , drop = FALSE]
+xreg_test  <- xreg_matrix[(n_train + 1):n_total, , drop = FALSE]
+
+cat("✅ Matrices regeneradas. Ahora intenta correr el auto.arima.")
+```
+
+
+```{r}
+modelo_fit <- auto.arima(
+  train_ts,
+  xreg = xreg_train,     # Inclusión de covariable
+  seasonal = TRUE,       # Permitir parte estacional SARIMA
+  stepwise = FALSE,      # Búsqueda exhaustiva
+  approximation = FALSE  # Evitar aproximaciones
+)
+
+summary(modelo_fit)
+```
+
+```{r}
+checkresiduals(modelo_fit)
+
+# Prueba formal Ljung-Box
+lb_test <- Box.test(residuals(modelo_fit), type = "Ljung-Box", lag = 14)
+print(lb_test)
+```
+
+```{r}
+pronostico <- forecast(modelo_fit, xreg = xreg_test, h = n_test)
+
+autoplot(pronostico) +
+  autolayer(test_ts, series = "Datos Reales", size = 1) +
+  labs(title = "Pronóstico vs Realidad (Team Fortress 2)",
+       y = "Jugadores", x = "Días (Horizonte de Pronóstico)") +
+  theme_minimal() +
+  scale_color_manual(values = c("red"))
+```
+
+```{r}
+accuracy(pronostico, test_ts)
+```
+
+```{r}
+# --- INGENIERÍA DE VARIABLES (HISTÓRICO EXTENDIDO) ---
+
+# Función maestra de fechas de ofertas (2010 - 2024)
+get_steam_sales_history <- function() {
+  list(
+    # --- 2024 ---
+    c("2024-03-14", "2024-03-21"), # Spring
+    c("2024-06-27", "2024-07-11"), # Summer
+    c("2024-11-27", "2024-12-04"), # Autumn
+    
+    # --- 2023 ---
+    c("2023-03-16", "2023-03-23"), # Spring
+    c("2023-06-29", "2023-07-13"), # Summer
+    c("2023-11-21", "2023-11-28"), # Autumn
+    c("2023-12-21", "2024-01-04"), # Winter
+    
+    # --- 2022 ---
+    c("2022-06-23", "2022-07-07"), # Summer
+    c("2022-11-22", "2022-11-29"), # Autumn
+    c("2022-12-22", "2023-01-05"), # Winter
+
+    # --- 2021 ---
+    c("2021-06-24", "2021-07-08"), # Summer
+    c("2021-11-24", "2021-11-30"), # Autumn
+    c("2021-12-22", "2022-01-05"), # Winter
+
+    # --- 2020 (Año Pandemia - Muy importante modelarlo) ---
+    c("2020-06-25", "2020-07-09"), # Summer
+    c("2020-11-25", "2020-12-01"), # Autumn
+    c("2020-12-22", "2021-01-05"), # Winter
+
+    # --- 2019 ---
+    c("2019-06-25", "2019-07-09"), # Summer
+    c("2019-11-26", "2019-12-03"), # Autumn
+    c("2019-12-19", "2020-01-02"), # Winter
+
+    # --- 2018 ---
+    c("2018-06-21", "2018-07-05"), # Summer
+    c("2018-11-21", "2018-11-27"), # Autumn
+    c("2018-12-20", "2019-01-03"), # Winter
+
+    # --- 2017 ---
+    c("2017-06-22", "2017-07-05"), # Summer
+    c("2017-11-22", "2017-11-28"), # Autumn
+    c("2017-12-21", "2018-01-04"), # Winter
+
+    # --- 2016 ---
+    c("2016-06-23", "2016-07-04"), # Summer
+    c("2016-11-23", "2016-11-29"), # Autumn
+    c("2016-12-22", "2017-01-02"), # Winter
+    
+    # --- 2015 ---
+    c("2015-06-11", "2015-06-21"), # Summer
+    c("2015-11-25", "2015-12-01"), # Autumn
+    c("2015-12-22", "2016-01-04"), # Winter
+
+    # --- Patrones Generales (2010-2014) ---
+    # Aproximación basada en fechas históricas típicas para no perder esos años
+    c("2014-06-19", "2014-06-30"), c("2014-12-18", "2015-01-02"),
+    c("2013-07-11", "2013-07-22"), c("2013-12-19", "2014-01-02"),
+    c("2012-07-12", "2012-07-23"), c("2012-12-20", "2013-01-04"),
+    c("2011-06-30", "2011-07-10"), c("2011-12-19", "2012-01-01"),
+    c("2010-06-24", "2010-07-04"), c("2010-12-20", "2011-01-02")
+  )
+}
+
+# --- APLICACIÓN AL DATAFRAME ---
+
+# 1. Recuperar la lista completa
+historial_ofertas <- get_steam_sales_history()
+
+# 2. Función vectorizada optimizada (más rápida que el loop anterior)
+es_oferta <- function(fechas_vector) {
+  # Creamos un vector de ceros del tamaño de los datos
+  resultado <- numeric(length(fechas_vector))
+  
+  # Iteramos sobre cada rango de oferta y marcamos con 1 las fechas que caigan dentro
+  for(rango in historial_ofertas) {
+    inicio <- as.Date(rango[1])
+    fin <- as.Date(rango[2])
+    
+    # Vectorización lógica: Pone 1 en todas las filas que cumplan la condición
+    resultado[fechas_vector >= inicio & fechas_vector <= fin] <- 1
+  }
+  return(resultado)
+}
+
+cat(" Procesando histórico de ofertas (2010-2024)... esto es rápido.\n")
+datos$oferta_steam <- es_oferta(datos$fecha)
+
+# 3. Validar cuántos días de oferta detectamos
+cat("\n Días marcados como 'Oferta' en tu dataset:\n")
+print(table(datos$oferta_steam))
+# Deberías ver unos 300-400 días marcados con '1' si usas toda la historia.
+
+# 4. Actualizar Dummy de Fin de Semana (Numérico)
+datos <- datos %>%
+  mutate(
+    wd = wday(fecha, week_start = 1),
+    fin_de_semana = ifelse(wd %in% c(5, 6, 7), 1, 0)
+  )
+
+# --- PREPARACIÓN DEL MODELO ---
+# AHORA SÍ: Podemos usar mucha más historia para entrenar
+# Probemos con los últimos 4 años (post-2020) que son los más relevantes
+datos_recent <- tail(datos, 365 * 4) 
+
+xreg_matrix <- as.matrix(datos_recent[, c("fin_de_semana", "oferta_steam")])
+ts_jugadores <- ts(datos_recent$jugadores, frequency = 7)
+
+# ... (Continúa con el split train/test y auto.arima igual que antes)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

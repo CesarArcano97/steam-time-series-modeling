@@ -1,0 +1,16 @@
+---
+title: "Modelado de Series de Tiempo: Team Fortress 2"
+author: "César - Maestría en Cómputo Estadístico"
+date: "`r Sys.Date()`"
+output:
+  html_notebook:
+    toc: true
+    toc_float: true
+    theme: united
+---
+
+```{r setup, include=FALSE}
+# Configuración global de chunks
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE, fig.width=10, fig.height=6)
+```
+

@@ -3,6 +3,7 @@ data/raw/
 data/processed/
 *.csv
 *.xlsx
+*.zip
 
 # Ignorar archivos de sistema y temporales
 .DS_Store

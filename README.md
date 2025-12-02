@@ -1,15 +1,15 @@
-# Modelado de Series de Tiempo en Steam
+## 📂 Datos
 
-Este repositorio contiene el código y la documentación para el análisis y modelado estocástico de la demanda de jugadores simultáneos (CCU) en la plataforma Steam.
+Este repositorio no contiene los archivos de datos por razones de almacenamiento.
 
-## Objetivo
-Aislar componentes estacionales (ciclos semanales) y efectos exógenos (ofertas, eventos) mediante técnicas de **Regresión con Errores ARMA**.
+**Instrucciones para reproducir:**
 
-## Estructura
-* `data/`: Datos crudos (JSON/CSV) y procesados.
-* `src/`: Scripts de extracción (Python) y modelado (R).
-* `results/`: Gráficos de diagnóstico y validación.
-
-## Stack
-* **Python:** Extracción de datos y preprocesamiento.
-* **R:** Modelado de series de tiempo (Forecast/Tseries).
+1. Descarga los históricos diarios desde SteamDB para los juegos deseados (formato CSV).
+2. Coloca los archivos en la carpeta `data/raw/` con los siguientes nombres:
+   - `steamdb_chart_440.csv` (Team Fortress 2)
+   - `steamdb_chart_730 (2).csv` (Counter-Strike 2)
+   - `steamdb_chart_1091500.csv` (Cyberpunk 2077)
+   - ...
+3. Ejecuta el script de procesamiento para generar los datasets limpios:
+   ```bash
+   python3 src/03_batch_process_all.py

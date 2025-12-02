@@ -2,14 +2,14 @@
 
 Este repositorio contiene el código y la documentación para el análisis y modelado estocástico de la demanda de jugadores simultáneos (CCU) en la plataforma Steam.
 
-## 🎯 Objetivo
+## Objetivo
 Aislar componentes estacionales (ciclos semanales) y efectos exógenos (ofertas, eventos) mediante técnicas de **Regresión con Errores ARMA**.
 
-## 📂 Estructura
+## Estructura
 * `data/`: Datos crudos (JSON/CSV) y procesados.
 * `src/`: Scripts de extracción (Python) y modelado (R).
 * `results/`: Gráficos de diagnóstico y validación.
 
-## 🛠️ Stack
+## Stack
 * **Python:** Extracción de datos y preprocesamiento.
 * **R:** Modelado de series de tiempo (Forecast/Tseries).

@@ -1,0 +1,590 @@
+---
+title: 'Modelado de Series de Tiempo: Team Fortress 2'
+author: "César - Maestría en Cómputo Estadístico"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    latex_engine: xelatex
+    toc: true
+  html_notebook:
+    toc: true
+    toc_float: true
+    theme: united
+  html_document:
+    toc: true
+    df_print: paged
+---
+
+# 1. Introducción y Configuración
+
+En este documento se realiza el análisis exploratorio y el modelado de series de tiempo para la actividad de jugadores en Steam. El objetivo es identificar patrones estacionales y cuantificar el impacto de eventos exógenos (fines de semana y ofertas).
+
+Primero, cargamos las librerías necesarias y el conjunto de datos unificado de **Team Fortress 2** para verificar la estructura inicial.
+
+```{r}
+library(ggplot2)
+library(dplyr)
+library(readr)
+library(forecast)
+library(tseries)
+library(lmtest)
+
+INPUT_FILE <- "/home/cesar/steam-time-series-modeling/data/processed/tf2_dataset_unificado.csv"
+
+datos <- read_csv(INPUT_FILE, show_col_types = FALSE) %>%
+  mutate(fecha = as.Date(fecha))
+
+cat("Datos iniciales cargados. Estructura:\n")
+glimpse(datos)
+
+```
+
+# 2. Validación Visual de Eventos Exógenos
+
+Antes de modelar, es crucial verificar visualmente que las variables exógenas (`oferta_steam` y `fin_de_semana`) estén correctamente alineadas con los picos de actividad.
+
+A continuación, generamos gráficos de "zoom" (2023-2025) para 5 títulos principales. Los puntos naranjas indican fines de semana y los rombos rojos indican periodos de oferta. Esto nos permite confirmar cualitativamente si los eventos impactan la serie.
+
+```{r}
+# Configuración de Juegos
+juegos_config <- list(
+  "tf2"            = "Team Fortress 2",
+  "cs2"            = "Counter-Strike 2",
+  "eve_online"     = "EVE Online",
+  "cyberpunk_2077" = "Cyberpunk 2077",
+  "dwarf_fortress" = "Dwarf Fortress"
+)
+
+cat("Generando gráficos de validación para todos los juegos...\n\n")
+
+for (slug in names(juegos_config)) {
+  titulo_juego <- juegos_config[[slug]]
+  archivo <- paste0("/home/cesar/steam-time-series-modeling/data/processed/", slug, "_dataset_unificado.csv")
+  
+  if(file.exists(archivo)) {
+    df <- read_csv(archivo, show_col_types = FALSE) %>% mutate(fecha = as.Date(fecha))
+    
+    # Filtro Zoom (2023 en adelante)
+    df_zoom <- df %>% filter(fecha >= as.Date("2023-01-01"))
+    
+    # Crear el Gráfico
+    p <- ggplot(df_zoom, aes(x = fecha, y = jugadores)) +
+      geom_line(color = "#2c3e50", alpha = 0.6, linewidth = 0.8) +
+      geom_point(data = subset(df_zoom, fin_de_semana == 1),
+                 aes(color = "Fin de Semana"), size = 1, alpha = 0.6) +
+      geom_point(data = subset(df_zoom, oferta_steam == 1),
+                 aes(color = "Oferta Steam"), size = 2.5, shape = 18) +
+      scale_color_manual(name = "Eventos", values = c("Fin de Semana" = "#f39c12", "Oferta Steam" = "#e74c3c")) +
+      labs(title = paste("Validación Visual:", titulo_juego), subtitle = "Zoom 2023-2025", y = "Jugadores", x = "") +
+      theme_minimal() + theme(legend.position = "top")
+    
+    print(p)
+    cat("\n------------------------------------------------\n")
+  }
+}
+```
+
+# 3. Preparación para Modelado ARIMAX
+
+Para el modelado, nos centraremos en **Team Fortress 2**. Utilizamos los últimos 4 años (1460 días) para capturar la dinámica reciente sin arrastrar ruido histórico antiguo.
+
+**Pasos de pre-procesamiento:**
+1.  **Conversión a Time Series (ts):** Frecuencia 7 (semanal).
+2.  **Matriz de Regresores (xreg):** Construimos una matriz con las variables `fin_de_semana` y `oferta_steam`.
+3.  **Chequeo de Varianza:** Implementamos un control de seguridad. Si una variable es constante (ej. no hubo ofertas en 4 años), su varianza es 0 y causaría error en el modelo. El código la detecta y la elimina automáticamente si es necesario.
+
+```{r}
+# Definimos los datos específicos para el modelo (TF2 en este caso)
+# NOTA: Aseguramos que 'datos' sea el dataframe correcto cargado en el Paso 1
+datos_model <- tail(datos, 1460) 
+
+ts_jugadores <- ts(datos_model$jugadores, frequency = 7)
+
+# Matriz de Regresores
+xreg_df <- datos_model[, c("fin_de_semana", "oferta_steam")]
+xreg_matrix <- as.matrix(xreg_df)
+
+# DIAGNÓSTICO DE SEGURIDAD
+col_varianza <- apply(xreg_matrix, 2, stats::var)
+
+if(any(col_varianza == 0)) {
+  cat(" ALERTA: Variable con varianza 0 detectada. Eliminando...\n")
+  xreg_matrix <- xreg_matrix[, col_varianza > 0, drop = FALSE]
+} else {
+  cat("Diagnóstico de regresores: OK (Todas las variables tienen varianza > 0).\n")
+}
+```
+
+
+### Nota Técnica: Diagnóstico de Variables Exógenas
+
+Durante la construcción de la matriz de regresores, el sistema de seguridad detectó y eliminó automáticamente una variable con **varianza cero**.
+
+**Interpretación para Team Fortress 2:**
+Este comportamiento es **esperado y correcto**. Dado que TF2 es un título *Free-to-Play* (Gratuito), la variable `oferta_steam` permanece constante en `0` durante todo el periodo analizado (no existen descuentos de precio sobre un producto gratuito).
+
+* **Acción del Algoritmo:** Se excluye la columna constante para evitar **singularidad matemática** (matriz no invertible) en la estimación de Máxima Verosimilitud.
+* **Implicación:** El modelo ARIMAX continuará ajustándose utilizando únicamente las variables que sí aportan información (como `fin_de_semana` y la propia estructura ARIMA), garantizando la estabilidad estadística.
+
+
+# 4. Ajuste del Modelo ARIMAX y Diagnóstico
+
+Procedemos a ajustar un modelo de **Regresión Dinámica con errores ARIMA**. 
+Separamos los últimos 30 días para validación (Test) y entrenamos con el resto.
+
+**Especificación del Modelo:**
+* **Componente ARIMA (1,1,1):** Para manejar la autocorrelación a corto plazo.
+* **Componente Estacional (1,0,0)[7]:** Para capturar el ciclo semanal de jugadores.
+* **Regresores Externos (xreg):** Para medir el impacto aditivo de ofertas y fines de semana.
+
+Finalmente, revisamos los residuos con `checkresiduals` para asegurar que se comporten como ruido blanco (sin patrones obvios restantes).
+
+```{r}
+# Split Train/Test
+n_test <- 30
+n_train <- length(ts_jugadores) - n_test
+
+train_ts <- subset(ts_jugadores, end = n_train)
+xreg_train <- xreg_matrix[1:n_train, , drop = FALSE]
+
+cat("Entrenando modelo con", n_train, "días...\n")
+
+tryCatch({
+  # Ajuste ARIMAX Manual
+  modelo_final <- Arima(
+    train_ts,
+    order = c(1, 1, 1),
+    seasonal = list(order = c(1, 0, 0), period = 7),
+    xreg = xreg_train,
+    method = "CSS-ML"
+  )
+  
+  cat("Modelo ajustado exitosamente.\n\n")
+  
+  # Coeficientes y Test T
+  cat("--- SIGNIFICANCIA ESTADÍSTICA ---\n")
+  print(coeftest(modelo_final))
+  
+  # Diagnóstico Visual
+  cat("\n--- REVISIÓN DE RESIDUOS ---\n")
+  checkresiduals(modelo_final)
+  
+}, error = function(e) {
+  cat("Error en el ajuste:", e$message, "\n")
+})
+```
+
+
+
+# 5. Modelado Comparativo Multi-Juego: Impacto de Ofertas vs. F2P
+
+A continuación, ejecutamos el algoritmo ARIMAX de forma iterativa para todos los títulos seleccionados. El objetivo es contrastar la dinámica de juegos **Free-to-Play** (como TF2 o CS2) frente a juegos **Premium** (como Cyberpunk 2077).
+
+**Lógica Adaptativa del Algoritmo:**
+El script evalúa cada juego individualmente:
+1.  **Si el juego es Premium:** Detectará varianza en la columna `oferta_steam`, la incluirá en el modelo y calculará su coeficiente de impacto.
+2.  **Si el juego es F2P:** Detectará varianza cero, eliminará la variable y ajustará un modelo puramente estacional (ARIMA + Fin de Semana).
+
+Esto nos permitirá ver cuantitativamente cuánto suben los jugadores cuando hay descuentos en los juegos de paga.
+
+```{r}
+library(forecast)
+library(lmtest)
+library(dplyr)
+library(readr)
+
+# Configuración
+juegos_config <- list(
+  "tf2"            = "Team Fortress 2",
+  "cs2"            = "Counter-Strike 2",
+  "eve_online"     = "EVE Online",
+  "cyberpunk_2077" = "Cyberpunk 2077",
+  "dwarf_fortress" = "Dwarf Fortress"
+)
+
+cat("========================================================\n")
+cat("   INICIANDO MODELADO MASIVO ARIMAX (ADAPTATIVO)   \n")
+cat("========================================================\n\n")
+
+for (slug in names(juegos_config)) {
+  titulo <- juegos_config[[slug]]
+  archivo <- paste0("/home/cesar/steam-time-series-modeling/data/processed/", slug, "_dataset_unificado.csv")
+  
+  if(file.exists(archivo)) {
+    cat(paste0("\n>>> ANALIZANDO: ", titulo, " <<<\n"))
+    
+    # 1. Carga y Prep
+    df <- read_csv(archivo, show_col_types = FALSE) %>% 
+      mutate(fecha = as.Date(fecha))
+    
+    datos_model <- tail(df, 1460) # Últimos 4 años
+    ts_juego <- ts(datos_model$jugadores, frequency = 7)
+    
+    # 2. Matriz Exógena Inicial
+    xreg_df <- datos_model[, c("fin_de_semana", "oferta_steam")]
+    xreg_mat <- as.matrix(xreg_df)
+    
+    # 3. DIAGNÓSTICO DE SEGURIDAD (ADAPTATIVO)
+    varianzas <- apply(xreg_mat, 2, stats::var)
+    vars_a_usar <- names(varianzas)[varianzas > 0]
+    vars_eliminadas <- names(varianzas)[varianzas == 0]
+    
+    if(length(vars_eliminadas) > 0) {
+      cat(sprintf("   [i] Ajuste F2P/Constante: Se eliminó '%s' (Varianza 0)\n", vars_eliminadas))
+    } else {
+      cat("   [i] Modo Premium: Se utilizan TODAS las variables exógenas (incluye Ofertas).\n")
+    }
+    
+    # Filtrar matriz
+    xreg_final <- xreg_mat[, vars_a_usar, drop = FALSE]
+    
+    # 4. Ajuste del Modelo
+    # Split Train (dejamos 30 días fuera para test, aunque aquí ajustamos con train)
+    n_train <- length(ts_juego) - 30
+    train_ts <- subset(ts_juego, end = n_train)
+    xreg_train <- xreg_final[1:n_train, , drop = FALSE]
+    
+    tryCatch({
+      modelo <- Arima(
+        train_ts,
+        order = c(1, 1, 1),
+        seasonal = list(order = c(1, 0, 0), period = 7),
+        xreg = xreg_train,
+        method = "CSS-ML"
+      )
+      
+      # 5. Mostrar Coeficientes (Lo que nos interesa)
+      cat("\n   RESULTADOS (Coeficientes Significativos):\n")
+      print(coeftest(modelo))
+      
+      # Interpretación rápida para el usuario
+      if("oferta_steam" %in% rownames(coeftest(modelo))) {
+        coef_oferta <- coeftest(modelo)["oferta_steam", "Estimate"]
+        p_val <- coeftest(modelo)["oferta_steam", "Pr(>|z|)"]
+        
+        if(p_val < 0.05 & coef_oferta > 0) {
+          cat(sprintf("\n   CONCLUSIÓN: Las ofertas AUMENTAN los jugadores en aprox. %.0f usuarios diarios.\n", coef_oferta))
+        }
+      }
+      
+    }, error = function(e) {
+      cat("   Error en el modelado:", e$message, "\n")
+    })
+    
+    cat("--------------------------------------------------------\n")
+    
+  } else {
+    cat(sprintf("⚠️ Archivo no encontrado: %s\n", slug))
+  }
+}
+```
+```{r}
+library(dplyr)
+library(readr)
+
+# Cargar solo Cyberpunk para auditar
+archivo_cp <- "/home/cesar/steam-time-series-modeling/data/processed/cyberpunk_2077_dataset_unificado.csv"
+df_cp <- read_csv(archivo_cp, show_col_types = FALSE)
+
+cat("=== AUDITORÍA DE DATOS: CYBERPUNK 2077 ===\n")
+cat("Total de registros:", nrow(df_cp), "\n")
+
+# 1. ¿Qué valores únicos existen en 'oferta_steam'?
+valores_oferta <- unique(df_cp$oferta_steam)
+cat("Valores únicos en columna oferta_steam:", paste(valores_oferta, collapse = ", "), "\n")
+
+# 2. Conteo
+conteo <- table(df_cp$oferta_steam)
+print(conteo)
+
+# 3. Verificación de Fechas (para asegurar que cubrimos periodos de rebajas conocidos)
+cat("\nRango de fechas:", as.character(min(df_cp$fecha)), "a", as.character(max(df_cp$fecha)), "\n")
+```
+
+###  Corrección Técnica: Diagnóstico de "Varianza Cero" y Granularidad
+
+Durante la iteración inicial del modelo, observamos un comportamiento anómalo: juegos Premium (como *Cyberpunk 2077*) reportaban **varianza cero** en la variable de `oferta_steam`, eliminándola del análisis.
+
+Tras una auditoría de datos, identificamos la causa raíz: **Inconsistencia en la Granularidad Temporal**.
+
+1.  **El Problema:** Los archivos `csv` originales contenían múltiples registros por día (duplicados o snapshots horarios), resultando en aproximadamente ~1.8 filas por fecha.
+2.  **El Error de Muestreo:** Al seleccionar los últimos 1460 registros con `tail(datos, 1460)`, el código asumía que 1 fila = 1 día. Debido a la duplicidad, esta instrucción solo cubría un periodo real mucho menor (aprox. 1.5 a 2 años), recortando accidentalmente los periodos históricos donde ocurrieron las ofertas.
+3.  **La Solución (ETL on-the-fly):** Se implementó una etapa de pre-procesamiento dentro del bucle que:
+    * **Agrupa** los datos por `fecha`.
+    * **Consolida** las banderas binarias usando `max
+
+# 6. Modelado Masivo con Corrección de Granularidad
+
+En esta etapa ejecutamos el bucle de modelado para todos los títulos definidos. 
+
+**Corrección Importante (ETL "al vuelo"):**
+Se detectó que los archivos originales contenían múltiples registros por día (duplicados o granularidad horaria), lo que provocaba que el modelo "perviera" las ofertas al cortar los datos. 
+
+Para solucionar esto, se aplica una agregación antes del modelado:
+1.  **Agrupar por Fecha:** Se fusionan todos los registros del mismo día.
+2.  **Consolidación:** Se toma el promedio de jugadores y el valor máximo de las banderas (`max(oferta_steam)`), asegurando que si hubo una oferta en cualquier momento del día, el día cuente como oferta.
+3.  **Ordenamiento:** Se asegura el orden cronológico estricto.
+
+Esto permitirá que juegos como **Cyberpunk 2077** reflejen correctamente la varianza en sus ofertas, mientras que juegos F2P como **TF2** seguirán eliminando la variable por ser realmente constante.
+
+
+
+```{r}
+library(forecast)
+library(lmtest)
+library(dplyr)
+library(readr)
+library(tseries)
+
+# 1. Configuración
+juegos_config <- list(
+  "tf2"            = "Team Fortress 2",
+  "cs2"            = "Counter-Strike 2",
+  "eve_online"     = "EVE Online",
+  "cyberpunk_2077" = "Cyberpunk 2077",
+  "dwarf_fortress" = "Dwarf Fortress"
+)
+
+cat("==============================================================\n")
+cat("   MODELADO ARIMAX MULTI-JUEGO (CON AGREGACIÓN DIARIA)   \n")
+cat("==============================================================\n\n")
+
+for (slug in names(juegos_config)) {
+  
+  titulo <- juegos_config[[slug]]
+  archivo <- paste0("/home/cesar/steam-time-series-modeling/data/processed/", slug, "_dataset_unificado.csv")
+  
+  if(file.exists(archivo)) {
+    cat(paste0("\n>>> PROCESANDO: ", titulo, " <<<\n"))
+    
+    # ---------------------------------------------------------
+    # PASO A: CARGA Y LIMPIEZA (LA CORRECCIÓN)
+    # ---------------------------------------------------------
+    df_raw <- read_csv(archivo, show_col_types = FALSE)
+    
+    df_clean <- df_raw %>%
+      mutate(fecha = as.Date(fecha)) %>%
+      # Agregación para garantizar 1 fila por día
+      group_by(fecha) %>%
+      summarise(
+        jugadores = mean(jugadores, na.rm = TRUE),
+        oferta_steam = max(oferta_steam, na.rm = TRUE),   # Salva el 1 si existe
+        fin_de_semana = max(fin_de_semana, na.rm = TRUE)
+      ) %>%
+      arrange(fecha) # Orden cronológico vital para Time Series
+    
+    # ---------------------------------------------------------
+    # PASO B: PREPARACIÓN DE SERIES DE TIEMPO
+    # ---------------------------------------------------------
+    # Tomamos los últimos 4 años (1460 días)
+    datos_model <- tail(df_clean, 1460)
+    
+    cat(sprintf("   Datos: %d días únicos. Rango: %s a %s\n", 
+                nrow(datos_model), min(datos_model$fecha), max(datos_model$fecha)))
+    
+    # Crear objeto TS
+    ts_juego <- ts(datos_model$jugadores, frequency = 7)
+    
+    # Matriz de Regresores Inicial
+    xreg_df <- datos_model[, c("fin_de_semana", "oferta_steam")]
+    xreg_mat <- as.matrix(xreg_df)
+    
+    # ---------------------------------------------------------
+    # PASO C: FILTRO DE VARIABLES (ARREGLADO)
+    # ---------------------------------------------------------
+    varianzas <- apply(xreg_mat, 2, stats::var)
+    vars_a_usar <- names(varianzas)[varianzas > 0]
+    
+    # Mensaje de diagnóstico
+    if("oferta_steam" %in% vars_a_usar) {
+      cat("   [i] TIPO DE JUEGO: PREMIUM (Se detectaron ofertas activas).\n")
+    } else {
+      cat("   [i] TIPO DE JUEGO: FREE-TO-PLAY / CONSTANTE (No hay ofertas, se elimina variable).\n")
+    }
+    
+    # Filtrar matriz final
+    xreg_final <- xreg_mat[, vars_a_usar, drop = FALSE]
+    
+    # ---------------------------------------------------------
+    # PASO D: AJUSTE DEL MODELO
+    # ---------------------------------------------------------
+    # Split Train (dejamos 30 días para test visual futuro)
+    n_train <- length(ts_juego) - 30
+    train_ts <- subset(ts_juego, end = n_train)
+    xreg_train <- xreg_final[1:n_train, , drop = FALSE]
+    
+    tryCatch({
+      modelo <- Arima(
+        train_ts,
+        order = c(1, 1, 1),
+        seasonal = list(order = c(1, 0, 0), period = 7),
+        xreg = xreg_train,
+        method = "CSS-ML"
+      )
+      
+      # Imprimir resultados
+      cat("\n   --- COEFICIENTES ESTIMADOS ---\n")
+      print(coeftest(modelo))
+      
+      # Interpretación rápida de Ofertas
+      if("oferta_steam" %in% rownames(coeftest(modelo))) {
+        coef <- coeftest(modelo)["oferta_steam", "Estimate"]
+        pval <- coeftest(modelo)["oferta_steam", "Pr(>|z|)"]
+        
+        if(pval < 0.05 && coef > 0) {
+          cat(sprintf("\n   IMPACTO POSITIVO: Las ofertas generan +%.0f jugadores promedio.\n", coef))
+        } else {
+          cat("\n   ⚠️ Las ofertas están presentes pero no son estadísticamente significativas.\n")
+        }
+      }
+      
+    }, error = function(e) {
+      cat("   Error crítico en el modelo:", e$message, "\n")
+    })
+    
+    cat("--------------------------------------------------------------\n")
+    
+  } else {
+    cat(sprintf("⚠️ Archivo no encontrado: %s\n", slug))
+  }
+}
+```
+
+# 7. Refinamiento de Hipótesis: Efectos Retardados (Lag) en Títulos AAA
+
+**Observación:**
+Los resultados del modelo general mostraron que la variable `oferta_steam` (efecto inmediato) no presentaba significancia estadística para títulos *Premium* como *Cyberpunk 2077* ($p > 0.05$). Esto resulta contraintuitivo desde una perspectiva de negocio.
+
+**Hipótesis de Latencia ("Download Lag"):**
+Proponemos que, para videojuegos de alto rendimiento ("AAA"), existe un desacople temporal entre la **compra** y la **sesión de juego**.
+1.  **Restricción Técnica:** *Cyberpunk 2077* tiene un tamaño de instalación superior a 70 GB. Dependiendo de la velocidad de conexión, la descarga puede impedir jugar el mismo día de la transacción.
+2.  **Patrón de Consumo:** Es probable que los usuarios adquieran el producto al recibir la notificación de oferta (ej. un jueves), pero posterguen la sesión de juego efectiva hasta 24 o 48 horas después (ej. fin de semana).
+
+**Estrategia de Modelado:**
+Para capturar este fenómeno, introducimos **variables exógenas retardadas** (*lagged regressors*) en la matriz de diseño:
+* `oferta_lag1`: Captura el impacto de una oferta vigente en $t-1$ (ayer).
+* `oferta_lag2`: Captura el impacto de una oferta vigente en $t-2$ (antier).
+
+
+```{r}
+library(dplyr)
+library(readr)
+library(forecast)
+library(lmtest)
+
+# 1. Carga y Agregación Diaria (Asegurando consistencia)
+archivo_cp <- "/home/cesar/steam-time-series-modeling/data/processed/cyberpunk_2077_dataset_unificado.csv"
+
+df_cp <- read_csv(archivo_cp, show_col_types = FALSE) %>%
+  mutate(fecha = as.Date(fecha)) %>%
+  group_by(fecha) %>%
+  summarise(
+    jugadores = mean(jugadores, na.rm = TRUE),
+    oferta_steam = max(oferta_steam, na.rm = TRUE),
+    fin_de_semana = max(fin_de_semana, na.rm = TRUE)
+  ) %>%
+  arrange(fecha)
+
+# 2. Ingeniería de Características: Creación de Lags
+# Creamos columnas que miran hacia atrás en el tiempo
+df_lagged <- df_cp %>%
+  mutate(
+    oferta_lag1 = dplyr::lag(oferta_steam, 1, default = 0), # ¿Hubo oferta ayer?
+    oferta_lag2 = dplyr::lag(oferta_steam, 2, default = 0)  # ¿Hubo oferta antier?
+  )
+
+# Filtramos los últimos 4 años (1460 días)
+datos_model <- tail(df_lagged, 1460)
+ts_cp <- ts(datos_model$jugadores, frequency = 7)
+
+# 3. Construcción de la Matriz de Regresores con Retardos
+# Incluimos: Fin de semana, Oferta hoy, Oferta ayer, Oferta antier
+xreg_cols <- c("fin_de_semana", "oferta_steam", "oferta_lag1", "oferta_lag2")
+xreg_matrix <- as.matrix(datos_model[, xreg_cols])
+
+cat("=== MODELO CYBERPUNK 2077: ANÁLISIS DE RETARDOS (LAGS) ===\n")
+cat("Periodo analizado:", as.character(min(datos_model$fecha)), "a", as.character(max(datos_model$fecha)), "\n\n")
+
+# 4. Ajuste del Modelo ARIMAX
+tryCatch({
+  fit_lag <- Arima(
+    ts_cp, 
+    order = c(1,1,1), 
+    seasonal = list(order = c(1,0,0), period = 7), 
+    xreg = xreg_matrix,
+    method = "CSS-ML"
+  )
+  
+  print(coeftest(fit_lag))
+  
+  cat("\n--- Interpretación ---\n")
+  coefs <- coeftest(fit_lag)
+  
+  # Chequeo rápido de lags
+  if(coefs["oferta_lag1", "Pr(>|z|)"] < 0.05 || coefs["oferta_lag2", "Pr(>|z|)"] < 0.05) {
+    cat("HIPÓTESIS CONFIRMADA: Se detectó un impacto significativo diferido (Lag).\n")
+    cat("Esto sugiere que los jugadores entran al juego 24-48 horas después del inicio de la oferta.\n")
+  } else {
+    cat("La hipótesis de Lag no mejoró la significancia. El impacto de las ofertas es difícil de aislar del ruido estacional.\n")
+  }
+  
+}, error = function(e) {
+  cat("Error en el modelo:", e$message)
+})
+```
+
+### Validación de Hipótesis: El Efecto "Download Lag" en Cyberpunk 2077
+
+Los resultados del modelo con retardos confirman nuestra teoría técnica con una significancia estadística del 99% ($p < 0.01$):
+
+1.  **Día 0 (Inicio de Oferta):** El impacto es nulo ($p = 0.58$). Los usuarios compran, pero no juegan inmediatamente (probablemente debido a la descarga de >70GB).
+2.  **Día 1 (Efecto Latente):** La variable `oferta_lag1` resulta **estadísticamente significativa** ($p = 0.0059$).
+3.  **Cuantificación:** El modelo estima que una oferta incrementa el tráfico en aproximadamente **+2,622 jugadores concurrentes** al día siguiente del inicio de la promoción.
+
+**Conclusión:** Para títulos "pesados" (AAA), el análisis de impacto debe considerar obligatoriamente una ventana de latencia de 24 horas. Ignorar este retardo lleva a la conclusión errónea de que las ofertas no funcionan.
+
+```{r}
+library(ggplot2)
+
+# 1. Extraer valores ajustados (Fitted) del modelo
+datos_plot <- datos_model %>%
+  mutate(
+    prediccion = as.numeric(fitted(fit_lag)),
+    residuo = as.numeric(residuals(fit_lag))
+  )
+
+# 2. Filtrar un periodo interesante (ej. últimos 6 meses) para ver el detalle
+# Buscamos un periodo donde sepamos que hubo ofertas para ver el "salto"
+fecha_inicio_zoom <- max(datos_plot$fecha) - 180
+df_zoom <- datos_plot %>% filter(fecha >= fecha_inicio_zoom)
+
+cat("Generando gráfico de ajuste con Lag para el periodo:", as.character(min(df_zoom$fecha)), "a", as.character(max(df_zoom$fecha)), "\n")
+
+# 3. Gráfico de Precisión
+ggplot(df_zoom, aes(x = fecha)) +
+  # Línea de Datos Reales
+  geom_line(aes(y = jugadores, color = "Datos Reales"), alpha = 0.6, linewidth = 0.8) +
+  
+  # Línea del Modelo (Predicción)
+  geom_line(aes(y = prediccion, color = "Modelo ARIMAX (con Lag)"), linewidth = 0.8) +
+  
+  # Marcar días de Oferta (Día 0)
+  geom_point(data = subset(df_zoom, oferta_steam == 1),
+             aes(y = jugadores, shape = "Inicio Oferta"), color = "red", size = 3, alpha = 0.8) +
+  
+  # Estética
+  scale_color_manual(name = "Serie", values = c("Datos Reales" = "black", "Modelo ARIMAX (con Lag)" = "#00d2be")) +
+  scale_shape_manual(name = "Eventos", values = c("Inicio Oferta" = 18)) +
+  
+  labs(title = "Modelado de Cyberpunk 2077: Ajuste con Retardo (Lag)",
+       subtitle = "Nótese cómo el modelo captura la subida de jugadores POSTERIOR al punto rojo (oferta)",
+       y = "Jugadores Simultáneos", x = "") +
+  theme_minimal() +
+  theme(legend.position = "top")
+```
+
+
+
+
+
+

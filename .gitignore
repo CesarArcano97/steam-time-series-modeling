@@ -22,3 +22,11 @@ data/processed/*
 .Rproj.user
 __pycache__/
 *.pyc
+
+# Reportes generados
+*.html
+*.nb.html
+*.pdf
+
+# Imagenes en raiz (mover a results/figures si son necesarias)
+/*.png
